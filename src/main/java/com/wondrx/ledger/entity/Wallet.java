@@ -9,8 +9,11 @@ import java.math.BigDecimal;
 import java.util.Objects;
 import java.util.UUID;
 
+import org.hibernate.annotations.Check;
+
 @Entity
 @Table(name = "wallets")
+@Check(constraints = "balance >= 0")
 public class Wallet {
 
     @Id
