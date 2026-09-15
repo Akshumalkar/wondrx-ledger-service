@@ -1,64 +1,39 @@
-# Internal Transaction Ledger Service
-### Idempotent Payment & Wallet Event Processor
+# Idempotent Payment & Wallet Event Processor
 
-[![Build & Test](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
-[![Java](https://img.shields.io/badge/Java-17%2B%20%7C%2021-orange.svg)]()
-[![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.3.4-brightgreen.svg)]()
-[![Database](https://img.shields.io/badge/H2-In--Memory%20Zero--Config-blue.svg)]()
-
-Production-grade Spring Boot service designed to process payment gateway debit webhooks idempotently and reliably under high concurrency.
-
----
-
-## Key Highlights
-
-- **Zero-Config Execution**: Evaluated directly in IntelliJ IDEA or via `mvn test` without setting up any external databases or containers.
-- **Strict Idempotency**: Guarantees that concurrent duplicate webhooks arriving within milliseconds deduct the wallet balance **strictly once**; duplicate requests return `409 Conflict`.
-- **Concurrency & Race Condition Prevention**: Uses **database-level pessimistic write locking** (`SELECT ... FOR UPDATE`) to prevent negative balances during concurrent debit bursts.
-- **Documented Decision Log**: See [`DECISIONS.md`](./DECISIONS.md) for architectural justifications and an honest analysis of AI assistance during design.
-
----
+An internal transaction ledger service built with Spring Boot that safely processes debit webhooks under high concurrency, guarantees idempotency against duplicate webhook deliveries, and prevents negative balances using database-level locking.
 
 ## Tech Stack
-
-- **Language**: Java 17+ (built and tested with Java 21 / 22)
-- **Framework**: Spring Boot 3.3.4 (Spring Web, Spring Data JPA, Bean Validation)
-- **Database**: In-memory H2 database
-- **Testing**: JUnit 5, AssertJ, Spring Boot Test (`TestRestTemplate` over real random HTTP ports)
+- **Java 17+** (Developed and tested with Java 21)
+- **Spring Boot 3.3.4** (Spring Web, Spring Data JPA, Bean Validation)
+- **H2 In-Memory Database** (Zero-config setup for instant local evaluation)
+- **JUnit 5 & AssertJ**
 
 ---
 
-## Architecture Overview
+## Architecture & Concurrency Model
 
-```mermaid
-flowchart TD
-    Client["Payment Gateway Webhook"] -->|POST /api/v1/transactions/process| Controller["TransactionController"]
-    Controller --> Service["TransactionService"]
-    
-    subgraph Concurrency & Idempotency Pipeline
-        Service --> PreCheck{"Pre-check: Tx ID exists?"}
-        PreCheck -- "Yes" --> Conflict409["Return 409 Conflict"]
-        PreCheck -- "No" --> LockAcquisition["Acquire DB Pessimistic Lock on Wallet\n(SELECT ... FOR UPDATE)"]
-        
-        LockAcquisition --> PostLockCheck{"Post-lock check: Tx ID exists?"}
-        PostLockCheck -- "Yes" --> Conflict409
-        PostLockCheck -- "No" --> BalanceCheck{"Wallet Balance >= Debit Amount?"}
-        
-        BalanceCheck -- "No" --> Insufficient400["Throw InsufficientFundsException\n(HTTP 400 Bad Request)"]
-        BalanceCheck -- "Yes" --> DebitUpdate["Deduct Balance + Save Wallet\n+ Save Transaction Ledger"]
-        DebitUpdate --> Commit["Commit Transaction & Return 200 OK"]
-    end
-```
+1. **Pessimistic Row-Level Locking (`PESSIMISTIC_WRITE`)**:
+   - In `WalletRepository`, `findByUserIdForUpdate()` executes `SELECT ... FOR UPDATE` on the user's wallet row.
+   - When concurrent debit requests hit the same wallet, they queue sequentially in the database engine.
+   - Each request reads the latest committed balance, ensuring debits decrement the balance accurately down to zero before any further requests fail with `400 Bad Request` (Insufficient Funds).
+
+2. **Idempotency Guarantee**:
+   - `transaction_id` is defined as the Primary Key on the `transactions` table.
+   - In `TransactionService`, an initial `existsById` check avoids locking the wallet for late retries.
+   - In-flight simultaneous duplicates wait on the wallet lock and re-check `existsById` once unlocked.
+   - Any database constraint collision throws `DataIntegrityViolationException`, which is caught and returned as `409 Conflict`. The wallet balance is never debited twice.
+
+3. **Ledger Auditability**:
+   - Every transaction record captures `balanceBefore` and `balanceAfter` to maintain a clear audit trail.
 
 ---
 
 ## API Specification
 
-### Webhook Ingestion Endpoint
-- **URL**: `POST /api/v1/transactions/process`
-- **Content-Type**: `application/json`
+**Endpoint:** `POST /api/v1/transactions/process`  
+**Content-Type:** `application/json`
 
-#### Request Payload
+### Request Body
 ```json
 {
   "transactionId": "550e8400-e29b-41d4-a716-446655440000",
@@ -68,94 +43,58 @@ flowchart TD
 }
 ```
 
-#### Response (Success - 200 OK)
-```json
-{
-  "transactionId": "550e8400-e29b-41d4-a716-446655440000",
-  "userId": "123e4567-e89b-12d3-a456-426614174000",
-  "amount": 250.00,
-  "type": "DEBIT",
-  "status": "SUCCESS",
-  "currentBalance": 750.00,
-  "message": "Transaction processed successfully",
-  "timestamp": "2026-09-15T11:46:57.969Z"
-}
-```
-
-#### Response (Duplicate Webhook - 409 Conflict)
-```json
-{
-  "status": 409,
-  "error": "Conflict",
-  "message": "Transaction 550e8400-e29b-41d4-a716-446655440000 has already been processed.",
-  "timestamp": "2026-09-15T11:46:57.975Z"
-}
-```
-
-#### Response (Insufficient Funds - 400 Bad Request)
-```json
-{
-  "status": 400,
-  "error": "Insufficient Funds",
-  "message": "Insufficient balance in wallet. Current: 0.00, Requested: 100.00",
-  "timestamp": "2026-09-15T11:46:58.083Z"
-}
-```
+### Responses
+- **`200 OK`**: Successfully processed debit.
+  ```json
+  {
+    "transactionId": "550e8400-e29b-41d4-a716-446655440000",
+    "userId": "123e4567-e89b-12d3-a456-426614174000",
+    "amount": 250.00,
+    "type": "DEBIT",
+    "status": "SUCCESS",
+    "currentBalance": 750.00,
+    "message": "Transaction processed successfully",
+    "timestamp": "2026-09-15T11:46:57.969Z"
+  }
+  ```
+- **`409 Conflict`**: Duplicate transaction received. Balance is not modified.
+- **`400 Bad Request`**: Insufficient balance or invalid input payload.
+- **`404 Not Found`**: Wallet not found for the specified `userId`.
 
 ---
 
-## Running the Integration Tests
+## Running the Tests
 
-The test suite requires **zero external configuration**.
+The project requires **zero external configuration** (no external databases, Docker, or Postman required).
 
-### Option A: Via IntelliJ IDEA (Evaluator Friendly)
-1. Open IntelliJ IDEA -> **File** -> **Open...** -> Select this repository directory.
+### Option 1: IntelliJ IDEA
+1. Open IntelliJ IDEA -> **File** -> **Open** -> Select this project directory.
 2. Navigate to `src/test/java/com/wondrx/ledger/TransactionIntegrationTest.java`.
-3. Right-click `TransactionIntegrationTest` -> Click **Run 'TransactionIntegrationTest'**.
-4. The test console clearly prints the **Intent** and **Result** for every scenario.
+3. Right-click the class and click **Run 'TransactionIntegrationTest'**.
+4. The test console prints the intent and result for each test scenario.
 
-### Option B: Via Command Line (Maven Wrapper included)
+### Option 2: Command Line (Maven Wrapper included)
 ```bash
-# Linux / macOS
+# On Linux / macOS:
 ./mvnw clean test
 
-# Windows (PowerShell / CMD)
+# On Windows:
 .\mvnw.cmd clean test
 ```
 
 ---
 
-## Test Cases Verified
+## Test Scenarios Verified
 
-| Test Case | Scenario Description | Status |
+| Test Name | Description | Status |
 | :--- | :--- | :---: |
-| **Happy Path Test** | *Processes a single valid debit transaction successfully.* | **PASSED** |
-| **Idempotency Test** | *Sends 3 identical transactionIDs simultaneously. Ensures the balance is only deducted once.* (1 succeeded with 200 OK, 2 rejected with 409 Conflict) | **PASSED** |
-| **Race Condition Test** | *Sends 10 concurrent debit requests of ₹100 for a wallet with a ₹500 balance. Ensures the final balance is exactly ₹0 and 5 requests fail with insufficient funds.* | **PASSED** |
-| **Edge Case: Insufficient Funds** | *Rejects single debit request when wallet balance is lower than transaction amount.* | **PASSED** |
-| **Edge Case: Wallet Not Found** | *Returns HTTP 404 when debiting against a non-existent wallet ID.* | **PASSED** |
+| **Happy Path Test** | Processes a single valid debit transaction successfully. | **PASSED** |
+| **Idempotency Test** | Sends 3 identical transactionIDs simultaneously. Ensures the balance is only deducted once (1 succeeds with 200, 2 return 409 Conflict). | **PASSED** |
+| **Race Condition Test** | Sends 10 concurrent debit requests of ₹100 for a wallet with a ₹500 balance. Ensures final balance is exactly ₹0 and 5 requests fail with insufficient funds. | **PASSED** |
+| **Edge Case: Insufficient Funds** | Rejects debit transaction when wallet has insufficient balance. | **PASSED** |
+| **Edge Case: Wallet Not Found** | Returns 404 Not Found when wallet does not exist. | **PASSED** |
 
 ---
 
-## Project Structure
-```text
-.
-├── DECISIONS.md                      # Answers to concurrency & AI decision questions
-├── README.md                         # Project documentation and instructions
-├── pom.xml                           # Maven dependencies and build configuration
-└── src
-    ├── main
-    │   ├── java/com/wondrx/ledger
-    │   │   ├── controller            # REST Controllers
-    │   │   ├── dto                   # Request / Response records
-    │   │   ├── entity                # JPA Entities (Wallet, Transaction)
-    │   │   ├── exception             # Custom exceptions & RestControllerAdvice
-    │   │   ├── repository            # Spring Data Repositories with @Lock
-    │   │   ├── service               # Transaction orchestration logic
-    │   │   └── LedgerApplication.java
-    │   └── resources
-    │       └── application.yml       # In-memory H2 config
-    └── test
-        └── java/com/wondrx/ledger
-            └── TransactionIntegrationTest.java # JUnit 5 zero-config tests
-```
+## Decision Log
+See [`DECISIONS.md`](./DECISIONS.md) for details on the concurrency locking strategy and an analysis of AI assistant trade-offs.

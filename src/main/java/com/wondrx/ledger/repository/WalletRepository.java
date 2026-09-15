@@ -16,10 +16,6 @@ import java.util.UUID;
 @Repository
 public interface WalletRepository extends JpaRepository<Wallet, UUID> {
 
-    /**
-     * Acquires a database-level exclusive write lock (SELECT ... FOR UPDATE)
-     * on the wallet row. Lock timeout is set to 5000ms to avoid indefinite thread blockage.
-     */
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @QueryHints({@QueryHint(name = "jakarta.persistence.lock.timeout", value = "5000")})
     @Query("SELECT w FROM Wallet w WHERE w.userId = :userId")

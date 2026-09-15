@@ -1,69 +1,42 @@
-# Technical Decisions & Engineering Log (`DECISIONS.md`)
+# DECISIONS.md
 
-**Role**: Java Backend Intern Assignment  
-**Service**: Idempotent Payment & Wallet Event Processor  
-**Author**: Akshay Malkar  
-**Date**: September 2026  
+### 1. How did you handle the concurrency race condition?
 
----
+To handle concurrency and prevent negative balances or double-deductions, I implemented database-level pessimistic locking (`SELECT ... FOR UPDATE`) using Spring Data JPA.
 
-## 1. How did you handle the concurrency race condition?
+Here was my thought process:
+- When multiple requests hit the same wallet at the exact same time (like the 10 concurrent requests of ₹100 against a ₹500 balance), there is a classic check-then-act race condition if we simply read the balance with a normal `findById`. Multiple threads would see ₹500 simultaneously, pass the balance check, and each deduct ₹100, which can easily push the balance negative or cause lost updates.
+- To fix this, I added `@Lock(LockModeType.PESSIMISTIC_WRITE)` to `walletRepository.findByUserIdForUpdate()`. When a thread starts processing a transaction, it acquires an exclusive write lock on that specific user's wallet row in the database. Any other incoming requests for the same wallet are queued by the database engine until the active transaction commits.
+- Because the operations are serialized at the row level:
+  - The first 5 requests acquire the lock one by one, deduct ₹100, and commit.
+  - The 6th request gets the lock, sees the balance has reached ₹0.00, and throws an `InsufficientFundsException` (returning HTTP 400).
+  - The remaining requests similarly observe ₹0.00 and fail cleanly without mutating state. The final balance is guaranteed to be strictly ₹0.00.
+  - I also added a lock timeout hint (`jakarta.persistence.lock.timeout = 5000ms`) to avoid threads hanging indefinitely in case of unexpected contention.
 
-When dealing with money and ledger entries, the cost of an error is asymmetric—a false negative (rejecting a request) can be retried, but a false positive (double spending or negative wallet balance) corrupts the accounting book and leads to financial loss.
-
-I addressed the concurrency race conditions through a **defense-in-depth architecture** operating across three distinct layers:
-
-### A. Database-Level Row Locking (`SELECT ... FOR UPDATE`)
-The primary challenge is the classic **Check-Then-Act** race condition:
-- Thread 1 and Thread 2 both read `balance = ₹500.00` concurrently.
-- Both verify that ₹500 >= ₹100.
-- Both deduct ₹100 and write back ₹400, resulting in ₹100 lost or double spending.
-
-To solve this deterministically without relying on fragile in-memory locking, I used JPA's `@Lock(LockModeType.PESSIMISTIC_WRITE)` on `WalletRepository.findByUserIdForUpdate(userId)`.
-- At the SQL engine level, this issues:
-  ```sql
-  SELECT user_id, balance FROM wallets WHERE user_id = ? FOR UPDATE;
-  ```
-- **How it behaves under concurrency**:
-  When 10 concurrent debit requests of ₹100 hit a wallet with a ₹500 balance, the database grants the exclusive write lock to the first thread. The remaining 9 threads are held in the database transaction queue.
-  - As each thread acquires the lock in turn, it reads the freshly committed balance:
-    - Threads 1 through 5 observe balances ₹500 -> ₹400 -> ₹300 -> ₹200 -> ₹100 -> ₹0.00 and succeed.
-    - Threads 6 through 10 acquire the lock, observe `balance = ₹0.00 < ₹100.00`, and immediately throw `InsufficientFundsException` (mapped to HTTP `400 Bad Request`).
-  - To prevent thread starvation or connection leaks in edge deadlock conditions, I added a lock timeout hint (`jakarta.persistence.lock.timeout = 5000ms`).
-
-### B. Two-Stage Idempotency Protection (Pre-Check + Post-Lock + DB Constraint)
-Payment gateways frequently retry webhooks when network latency spikes. When 3 identical `transactionId` payloads arrive within 50ms:
-1. **Pre-Lock Check (`transactionRepository.existsById`)**: If a retry arrives minutes later, this non-blocking check immediately avoids acquiring the wallet lock, saving database connection pool resources.
-2. **Post-Lock Check**: If 3 duplicates hit at the *exact same millisecond*, Thread A acquires the wallet lock first. Threads B and C queue behind it. Once Thread A commits, Threads B and C acquire the lock and re-evaluate `existsById(txId)`. Seeing the record committed, they reject with `DuplicateTransactionException` (HTTP `409 Conflict`) without touching the balance.
-3. **Engine-Level Primary Key Constraint**: The `transactions` table uses `transaction_id` as the primary key. In a multi-node cluster where requests might touch different replicas or connections, any concurrent duplicate insert attempt is stopped dead by a `DataIntegrityViolationException`, caught and converted into HTTP `409 Conflict`.
-
-### C. Double-Entry Audit Trail
-Rather than merely updating a number, every successful debit records:
-- `balanceBefore` and `balanceAfter`
-- `createdAt` UTC timestamp
-- `status = SUCCESS`
-This provides full ledger traceability for reconciliation.
+For duplicate transactions arriving concurrently (idempotency):
+- I set `transaction_id` as the primary key in the `transactions` table.
+- In `TransactionService`, I first do a fast `existsById` pre-check so already-committed retries don't even need to wait for the wallet lock.
+- If duplicate webhooks arrive simultaneously within milliseconds, the first thread holds the wallet lock while the others wait. Once the first thread commits, the waiting threads acquire the lock and re-check `existsById(txId)`. Finding the record already present, they throw `DuplicateTransactionException` (returning HTTP 409 Conflict) without touching the wallet.
+- If two transactions ever bypassed the check in a distributed setup, the database primary key constraint throws a `DataIntegrityViolationException`, which is caught and converted to HTTP 409 Conflict, ensuring the balance is never deducted twice.
 
 ---
 
-## 2. Where did your AI assistant give you an incorrect or sub-optimal suggestion?
+### 2. Where did your AI assistant give you an incorrect or sub-optimal suggestion?
 
-While using an AI assistant to scaffold ideas and explore design patterns, I noticed several critical flaws and sub-optimal suggestions that would have caused the system to fail in production or fail the assignment's explicit test criteria:
+While discussing design approaches with an AI assistant, it gave me three suggestions that turned out to be either incorrect or unsuitable for production:
 
-### Issue 1: Recommending Optimistic Locking (`@Version`)
-- **The AI's Proposal**: The AI initially suggested adding a `@Version Long version` column to `Wallet` and using optimistic concurrency control, arguing that "optimistic locking provides higher throughput and avoids row locks."
-- **Why It Broke**: In our test scenario (10 simultaneous debit requests of ₹100 against a ₹500 balance), optimistic locking completely failed. Because all 10 threads read version 0 simultaneously, Thread 1 committed version 1, and the other 9 threads immediately failed with `OptimisticLockException`.  
-  Only 1 request succeeded instead of 5, and the remaining 9 failed with database concurrency collisions rather than the required business validation (`Insufficient balance`).
-- **The Fix**: I discarded optimistic locking and implemented pessimistic write locking (`SELECT ... FOR UPDATE`). In balance debits, queuing is the exact desired behavior so funds are drained predictably down to zero.
+1. **Suggesting Optimistic Locking (`@Version`) instead of Pessimistic Locking:**
+   When I asked about handling concurrent balance updates, the AI's first response was to add a `@Version` column to the `Wallet` entity, arguing that optimistic locking is more scalable because it avoids database locks.
+   However, when I wrote the 10-thread test (10 requests of ₹100 against a ₹500 wallet), optimistic locking failed completely. Since all 10 threads read version 0 at the same time, the first thread committed version 1 and the other 9 threads crashed immediately with an `OptimisticLockException`.
+   As a result, only 1 request succeeded and 9 failed with database concurrency errors, rather than 5 succeeding and 5 failing due to "insufficient funds". For debiting a balance, threads need to queue and drain the balance sequentially, so database-level pessimistic locking (`SELECT ... FOR UPDATE`) was the right solution.
 
-### Issue 2: Recommending In-Memory Java Locks (`synchronized` / `ConcurrentHashMap`)
-- **The AI's Proposal**: The AI recommended synchronizing on user ID using `synchronized (userId.toString().intern())` in the service layer to avoid database lock overhead.
-- **Why It Broke**:
-  1. **Microservice Scalability**: In any production deployment (such as WonDRx services running in Kubernetes/containers behind an AWS ALB), requests are distributed across multiple JVM pods. In-memory locks only protect threads inside a single JVM; two requests on Pod 1 and Pod 2 would execute in parallel and corrupt the balance.
-  2. **String Interning Risks**: Calling `.intern()` on user-supplied UUID strings pollutes the JVM String Pool, risking PermGen/Metaspace memory pressure and potential cross-tenant lock collisions.
-- **The Fix**: I adhered strictly to the brief's requirement to use **database-level locking**, making the database the single, distributed source of truth.
+2. **Suggesting Java In-Memory Locks (`synchronized` / `ConcurrentHashMap`):**
+   The AI also suggested synchronizing on the user ID using `synchronized (userId.toString().intern())` in the service layer.
+   This had two major problems:
+   - In production, backend services are deployed across multiple instances/containers behind a load balancer. A JVM-level lock only coordinates threads within that single process; requests hitting different containers would still run concurrently and corrupt the balance.
+   - Calling `.intern()` on incoming request strings can easily lead to memory leaks in the JVM String Pool.
+   The assignment explicitly asked for database-level locking, which ensures a single source of truth across all instances.
 
-### Issue 3: Missing `saveAndFlush` and Deferred JPA Constraint Triggers
-- **The AI's Proposal**: The AI placed `transactionRepository.save(tx)` at the very end of the method with standard deferred execution.
-- **Why It Broke**: Hibernate defaults to dirty-checking and defers SQL inserts until transaction commit time (at the end of the `@Transactional` boundary). If two concurrent duplicate transactions reached the commit phase, the unique constraint exception was thrown *after* the wallet balance was modified in the session, resulting in confusing transaction rollback semantics.
-- **The Fix**: I added `transactionRepository.saveAndFlush(transaction)` to force the SQL INSERT immediately within the guarded block, ensuring unique constraint violations are surfaced and handled cleanly.
+3. **Missing immediate JPA flushing (`saveAndFlush`):**
+   The AI placed a basic `transactionRepository.save(tx)` at the end of the method without flushing. Because Hibernate defers SQL inserts until transaction commit time (at the end of the method), constraint violations for duplicate transactions were thrown during the commit phase after the wallet balance had already been mutated in memory.
+   I fixed this by using `saveAndFlush(transaction)` inside the method, ensuring that any uniqueness collision is caught immediately and handled within our try-catch block.

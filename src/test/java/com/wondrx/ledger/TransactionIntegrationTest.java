@@ -55,7 +55,7 @@ public class TransactionIntegrationTest {
     }
 
     @BeforeEach
-    void setUp() {
+    void cleanDatabase() {
         transactionRepository.deleteAll();
         walletRepository.deleteAll();
     }
@@ -69,12 +69,11 @@ public class TransactionIntegrationTest {
     @Test
     @DisplayName("Processes a single valid debit transaction successfully.")
     void testHappyPath() {
-        System.out.println("\n" + "=".repeat(80));
-        System.out.println("[TEST INTENT] Processes a single valid debit transaction successfully.");
-        System.out.println("Checking standard debit workflow with sufficient funds and valid payload.");
-        System.out.println("=".repeat(80));
+        System.out.println("\n------------------------------------------------------------");
+        System.out.println("TEST: Processes a single valid debit transaction successfully.");
+        System.out.println("INTENT: Verifies that a valid debit request against sufficient funds updates the balance.");
+        System.out.println("------------------------------------------------------------");
 
-        // 1. Arrange
         UUID userId = UUID.randomUUID();
         UUID transactionId = UUID.randomUUID();
         BigDecimal initialBalance = new BigDecimal("1000.00");
@@ -90,14 +89,12 @@ public class TransactionIntegrationTest {
                 TransactionType.DEBIT
         );
 
-        // 2. Act
         ResponseEntity<TransactionResponse> response = restTemplate.postForEntity(
                 getEndpointUrl(),
                 new HttpEntity<>(request, createHeaders()),
                 TransactionResponse.class
         );
 
-        // 3. Assert
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(response.getBody()).isNotNull();
         assertThat(response.getBody().currentBalance().setScale(2, RoundingMode.HALF_UP))
@@ -108,22 +105,20 @@ public class TransactionIntegrationTest {
                 .isEqualTo(expectedFinalBalance.setScale(2, RoundingMode.HALF_UP));
         assertThat(transactionRepository.existsById(transactionId)).isTrue();
 
-        System.out.println("[TEST RESULT] Status Code: " + response.getStatusCode());
-        System.out.println("[TEST RESULT] Initial Balance: " + initialBalance + ", Debit: " + debitAmount
-                + ", Resulting Balance: " + updatedWallet.getBalance());
-        System.out.println("[TEST RESULT] PASSED - Transaction processed and balance accurately debited.");
-        System.out.println("=".repeat(80) + "\n");
+        System.out.println("RESULT: HTTP " + response.getStatusCode() + " | Initial: " + initialBalance
+                + ", Debited: " + debitAmount + ", Final Balance: " + updatedWallet.getBalance());
+        System.out.println("STATUS: PASSED");
+        System.out.println("------------------------------------------------------------\n");
     }
 
     @Test
     @DisplayName("Sends 3 identical transactionIDs simultaneously. Ensures the balance is only deducted once.")
     void testIdempotentWebhookIngestion() throws Exception {
-        System.out.println("\n" + "=".repeat(80));
-        System.out.println("[TEST INTENT] Sends 3 identical transactionIDs simultaneously. Ensures the balance is only deducted once.");
-        System.out.println("Simulating 3 duplicate gateway webhooks arriving concurrently within milliseconds.");
-        System.out.println("=".repeat(80));
+        System.out.println("\n------------------------------------------------------------");
+        System.out.println("TEST: Sends 3 identical transactionIDs simultaneously. Ensures the balance is only deducted once.");
+        System.out.println("INTENT: Simulates duplicate webhooks arriving concurrently; exactly 1 succeeds and 2 return 409.");
+        System.out.println("------------------------------------------------------------");
 
-        // 1. Arrange
         UUID userId = UUID.randomUUID();
         UUID sharedTransactionId = UUID.randomUUID();
         BigDecimal initialBalance = new BigDecimal("1000.00");
@@ -149,7 +144,6 @@ public class TransactionIntegrationTest {
         for (int i = 0; i < threadCount; i++) {
             futures.add(executor.submit(() -> {
                 readyLatch.countDown();
-                // Wait for all threads to be ready so they fire simultaneously
                 startLatch.await(5, TimeUnit.SECONDS);
 
                 return restTemplate.exchange(
@@ -161,7 +155,6 @@ public class TransactionIntegrationTest {
             }));
         }
 
-        // Wait for all threads to reach the gate, then trigger all at the exact same instant
         readyLatch.await(5, TimeUnit.SECONDS);
         startLatch.countDown();
 
@@ -169,7 +162,6 @@ public class TransactionIntegrationTest {
         boolean completed = executor.awaitTermination(10, TimeUnit.SECONDS);
         assertThat(completed).isTrue();
 
-        // 2. Act & Collect
         AtomicInteger successCount = new AtomicInteger(0);
         AtomicInteger conflictCount = new AtomicInteger(0);
         List<HttpStatus> responseStatuses = Collections.synchronizedList(new ArrayList<>());
@@ -184,41 +176,30 @@ public class TransactionIntegrationTest {
             }
         }
 
-        // 3. Assert
         Wallet updatedWallet = walletRepository.findById(userId).orElseThrow();
 
-        System.out.println("[TEST RESULT] Response Statuses Received: " + responseStatuses);
-        System.out.println("[TEST RESULT] HTTP 200 OK count: " + successCount.get());
-        System.out.println("[TEST RESULT] HTTP 409 Conflict count: " + conflictCount.get());
-        System.out.println("[TEST RESULT] Wallet Initial Balance: " + initialBalance + ", Final Balance: " + updatedWallet.getBalance());
+        System.out.println("RESULT: Responses: " + responseStatuses);
+        System.out.println("RESULT: 200 OK count = " + successCount.get() + ", 409 Conflict count = " + conflictCount.get());
+        System.out.println("RESULT: Wallet Balance: " + initialBalance + " -> " + updatedWallet.getBalance());
 
-        assertThat(successCount.get())
-                .withFailMessage("Exactly one transaction must succeed")
-                .isEqualTo(1);
-
-        assertThat(conflictCount.get())
-                .withFailMessage("The remaining duplicate transactions must return 409 Conflict")
-                .isEqualTo(2);
-
+        assertThat(successCount.get()).isEqualTo(1);
+        assertThat(conflictCount.get()).isEqualTo(2);
         assertThat(updatedWallet.getBalance().setScale(2, RoundingMode.HALF_UP))
-                .withFailMessage("Balance should only be deducted exactly once")
                 .isEqualTo(expectedFinalBalance.setScale(2, RoundingMode.HALF_UP));
-
         assertThat(transactionRepository.count()).isEqualTo(1);
 
-        System.out.println("[TEST RESULT] PASSED - Exactly 1 succeeded, 2 rejected as 409 Conflict. Balance deducted once.");
-        System.out.println("=".repeat(80) + "\n");
+        System.out.println("STATUS: PASSED - Deducted exactly once, duplicates safely rejected with 409 Conflict.");
+        System.out.println("------------------------------------------------------------\n");
     }
 
     @Test
     @DisplayName("Sends 10 concurrent debit requests of ₹100 for a wallet with a ₹500 balance. Ensures the final balance is exactly ₹0 and 5 requests fail with insufficient funds.")
     void testRaceConditionUnderConcurrentDebits() throws Exception {
-        System.out.println("\n" + "=".repeat(80));
-        System.out.println("[TEST INTENT] Sends 10 concurrent debit requests of ₹100 for a wallet with a ₹500 balance.");
-        System.out.println("Ensures the final balance is exactly ₹0 and 5 requests fail with insufficient funds.");
-        System.out.println("=".repeat(80));
+        System.out.println("\n------------------------------------------------------------");
+        System.out.println("TEST: Sends 10 concurrent debit requests of ₹100 for a wallet with a ₹500 balance.");
+        System.out.println("INTENT: Serializes 10 parallel debit attempts: exactly 5 succeed, 5 fail, final balance is ₹0.");
+        System.out.println("------------------------------------------------------------");
 
-        // 1. Arrange
         UUID userId = UUID.randomUUID();
         BigDecimal initialBalance = new BigDecimal("500.00");
         BigDecimal debitAmount = new BigDecimal("100.00");
@@ -244,7 +225,6 @@ public class TransactionIntegrationTest {
 
             futures.add(executor.submit(() -> {
                 readyLatch.countDown();
-                // Synchronize all threads so they race simultaneously
                 startLatch.await(5, TimeUnit.SECONDS);
 
                 return restTemplate.exchange(
@@ -256,7 +236,6 @@ public class TransactionIntegrationTest {
             }));
         }
 
-        // Release all 10 threads simultaneously
         readyLatch.await(5, TimeUnit.SECONDS);
         startLatch.countDown();
 
@@ -264,7 +243,6 @@ public class TransactionIntegrationTest {
         boolean completed = executor.awaitTermination(15, TimeUnit.SECONDS);
         assertThat(completed).isTrue();
 
-        // 2. Act & Collect
         AtomicInteger successCount = new AtomicInteger(0);
         AtomicInteger insufficientFundsCount = new AtomicInteger(0);
         List<HttpStatus> statusCodes = Collections.synchronizedList(new ArrayList<>());
@@ -279,31 +257,20 @@ public class TransactionIntegrationTest {
             }
         }
 
-        // 3. Assert
         Wallet finalWallet = walletRepository.findById(userId).orElseThrow();
 
-        System.out.println("[TEST RESULT] Total Requests: " + totalRequests);
-        System.out.println("[TEST RESULT] Statuses Received: " + statusCodes);
-        System.out.println("[TEST RESULT] Successful Debits (HTTP 200): " + successCount.get());
-        System.out.println("[TEST RESULT] Failed Debits (HTTP 400 Insufficient Funds): " + insufficientFundsCount.get());
-        System.out.println("[TEST RESULT] Initial Balance: " + initialBalance + ", Final Balance: " + finalWallet.getBalance());
+        System.out.println("RESULT: Statuses: " + statusCodes);
+        System.out.println("RESULT: Successful (200 OK) = " + successCount.get() + ", Insufficient Funds (400) = " + insufficientFundsCount.get());
+        System.out.println("RESULT: Initial Balance = " + initialBalance + ", Final Balance = " + finalWallet.getBalance());
 
-        assertThat(successCount.get())
-                .withFailMessage("Exactly 5 debit requests should succeed")
-                .isEqualTo(5);
-
-        assertThat(insufficientFundsCount.get())
-                .withFailMessage("Exactly 5 debit requests should fail due to insufficient funds")
-                .isEqualTo(5);
-
+        assertThat(successCount.get()).isEqualTo(5);
+        assertThat(insufficientFundsCount.get()).isEqualTo(5);
         assertThat(finalWallet.getBalance().setScale(2, RoundingMode.HALF_UP))
-                .withFailMessage("Final balance must be exactly ₹0.00")
                 .isEqualTo(expectedFinalBalance.setScale(2, RoundingMode.HALF_UP));
-
         assertThat(transactionRepository.count()).isEqualTo(5);
 
-        System.out.println("[TEST RESULT] PASSED - Exactly 5 succeeded, 5 failed with insufficient funds. Final balance is ₹0.");
-        System.out.println("=".repeat(80) + "\n");
+        System.out.println("STATUS: PASSED - Exactly 5 debited, exactly 5 failed, final balance ₹0.");
+        System.out.println("------------------------------------------------------------\n");
     }
 
     @Test
