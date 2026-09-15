@@ -15,10 +15,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Isolation;
-import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -36,65 +36,71 @@ public class TransactionService {
     }
 
     /**
-     * Processes an incoming debit transaction idempotently and safely under concurrency.
-     * Uses pessimistic locking (SELECT ... FOR UPDATE) on the wallet row to serialize balance deductions.
-     * Enforces idempotency via unique transactionId constraints and pre-checks.
+     * Ingests and processes a debit webhook transaction.
+     * Uses pessimistic locking (SELECT ... FOR UPDATE) on the wallet to guarantee sequential execution
+     * across concurrent requests, strictly avoiding dirty reads or balance underflows.
      */
     @Transactional(isolation = Isolation.READ_COMMITTED)
     public TransactionResponse processTransaction(TransactionRequest request) {
-        log.info("Processing transaction: id={}, userId={}, amount={}, type={}",
-                request.transactionId(), request.userId(), request.amount(), request.type());
+        UUID txId = request.transactionId();
+        UUID userId = request.userId();
+        BigDecimal amount = request.amount().setScale(2, RoundingMode.HALF_EVEN);
 
-        // 1. Fast idempotency pre-check
-        if (transactionRepository.existsById(request.transactionId())) {
-            log.warn("Duplicate transaction detected in pre-check: {}", request.transactionId());
-            throw new DuplicateTransactionException(request.transactionId(),
-                    "Transaction " + request.transactionId() + " has already been processed.");
+        log.info("Processing debit transaction [txId={}, userId={}, amount={}]", txId, userId, amount);
+
+        // Fast non-locking pre-check for already committed transactions (avoids lock contention on late retries)
+        if (transactionRepository.existsById(txId)) {
+            log.warn("Idempotency violation: transaction {} was already committed", txId);
+            throw new DuplicateTransactionException(txId,
+                    "Transaction " + txId + " has already been processed.");
         }
 
-        // 2. Acquire database-level exclusive lock on the wallet
-        Wallet wallet = walletRepository.findByUserIdForUpdate(request.userId())
-                .orElseThrow(() -> new WalletNotFoundException(request.userId()));
+        // Acquire exclusive row-level lock on the target wallet
+        Wallet wallet = walletRepository.findByUserIdForUpdate(userId)
+                .orElseThrow(() -> new WalletNotFoundException(userId));
 
-        // 3. Re-check idempotency once exclusive lock is acquired (prevents race window)
-        if (transactionRepository.existsById(request.transactionId())) {
-            log.warn("Duplicate transaction detected after lock acquisition: {}", request.transactionId());
-            throw new DuplicateTransactionException(request.transactionId(),
-                    "Transaction " + request.transactionId() + " has already been processed.");
+        // Re-evaluate idempotency after obtaining lock to serialize concurrent in-flight duplicates
+        if (transactionRepository.existsById(txId)) {
+            log.warn("Idempotency violation post-lock: transaction {} exists", txId);
+            throw new DuplicateTransactionException(txId,
+                    "Transaction " + txId + " has already been processed.");
         }
 
-        // 4. Validate sufficient balance
-        if (wallet.getBalance().compareTo(request.amount()) < 0) {
-            log.warn("Insufficient funds for user {}: current balance={}, requested debit={}",
-                    request.userId(), wallet.getBalance(), request.amount());
-            throw new InsufficientFundsException("Insufficient balance in wallet. Current: "
-                    + wallet.getBalance() + ", Requested: " + request.amount());
+        BigDecimal balanceBefore = wallet.getBalance().setScale(2, RoundingMode.HALF_EVEN);
+
+        if (balanceBefore.compareTo(amount) < 0) {
+            log.warn("Debit rejected: insufficient funds for user {} [current={}, requested={}]",
+                    userId, balanceBefore, amount);
+            throw new InsufficientFundsException(String.format(
+                    "Insufficient balance in wallet. Current: %s, Requested: %s", balanceBefore, amount));
         }
 
-        // 5. Debit the wallet balance
-        wallet.debit(request.amount());
+        wallet.debit(amount);
         walletRepository.save(wallet);
 
-        // 6. Record the transaction ledger entry
+        BigDecimal balanceAfter = wallet.getBalance().setScale(2, RoundingMode.HALF_EVEN);
+
         Transaction transaction = new Transaction(
-                request.transactionId(),
-                request.userId(),
-                request.amount(),
+                txId,
+                userId,
+                amount,
                 request.type(),
                 TransactionStatus.SUCCESS,
+                balanceBefore,
+                balanceAfter,
                 Instant.now()
         );
 
         try {
             transactionRepository.saveAndFlush(transaction);
         } catch (DataIntegrityViolationException ex) {
-            log.warn("Unique constraint violation for transaction: {}", request.transactionId());
-            throw new DuplicateTransactionException(request.transactionId(),
-                    "Transaction " + request.transactionId() + " has already been processed.");
+            log.warn("Constraint violation saving transaction {}: duplicate detected", txId);
+            throw new DuplicateTransactionException(txId,
+                    "Transaction " + txId + " has already been processed.");
         }
 
-        log.info("Transaction {} succeeded. New balance for user {}: {}",
-                request.transactionId(), request.userId(), wallet.getBalance());
+        log.info("Debit successful for user {} [txId={}, balance: {} -> {}]",
+                userId, txId, balanceBefore, balanceAfter);
 
         return new TransactionResponse(
                 transaction.getTransactionId(),
@@ -102,27 +108,24 @@ public class TransactionService {
                 transaction.getAmount(),
                 transaction.getType(),
                 transaction.getStatus(),
-                wallet.getBalance(),
+                balanceAfter,
                 "Transaction processed successfully",
                 transaction.getCreatedAt()
         );
     }
 
-    /**
-     * Helper to create or top up a wallet for testing and initialization.
-     */
     @Transactional
     public Wallet createOrUpdateWallet(UUID userId, BigDecimal initialBalance) {
         Wallet wallet = walletRepository.findById(userId)
                 .orElse(new Wallet(userId, BigDecimal.ZERO));
-        wallet.setBalance(initialBalance);
+        wallet.setBalance(initialBalance.setScale(2, RoundingMode.HALF_EVEN));
         return walletRepository.saveAndFlush(wallet);
     }
 
     @Transactional(readOnly = true)
     public BigDecimal getWalletBalance(UUID userId) {
         return walletRepository.findById(userId)
-                .map(Wallet::getBalance)
+                .map(w -> w.getBalance().setScale(2, RoundingMode.HALF_EVEN))
                 .orElseThrow(() -> new WalletNotFoundException(userId));
     }
 }

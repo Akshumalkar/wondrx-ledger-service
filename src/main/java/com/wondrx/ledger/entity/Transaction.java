@@ -34,18 +34,27 @@ public class Transaction {
     @Column(name = "status", nullable = false, length = 20)
     private TransactionStatus status;
 
+    @Column(name = "balance_before", nullable = false, precision = 15, scale = 2, updatable = false)
+    private BigDecimal balanceBefore;
+
+    @Column(name = "balance_after", nullable = false, precision = 15, scale = 2, updatable = false)
+    private BigDecimal balanceAfter;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
     public Transaction() {
     }
 
-    public Transaction(UUID transactionId, UUID userId, BigDecimal amount, TransactionType type, TransactionStatus status, Instant createdAt) {
+    public Transaction(UUID transactionId, UUID userId, BigDecimal amount, TransactionType type,
+                       TransactionStatus status, BigDecimal balanceBefore, BigDecimal balanceAfter, Instant createdAt) {
         this.transactionId = transactionId;
         this.userId = userId;
         this.amount = amount;
         this.type = type;
         this.status = status;
+        this.balanceBefore = balanceBefore;
+        this.balanceAfter = balanceAfter;
         this.createdAt = createdAt;
     }
 
@@ -87,6 +96,22 @@ public class Transaction {
 
     public void setStatus(TransactionStatus status) {
         this.status = status;
+    }
+
+    public BigDecimal getBalanceBefore() {
+        return balanceBefore;
+    }
+
+    public void setBalanceBefore(BigDecimal balanceBefore) {
+        this.balanceBefore = balanceBefore;
+    }
+
+    public BigDecimal getBalanceAfter() {
+        return balanceAfter;
+    }
+
+    public void setBalanceAfter(BigDecimal balanceAfter) {
+        this.balanceAfter = balanceAfter;
     }
 
     public Instant getCreatedAt() {

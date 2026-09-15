@@ -305,4 +305,50 @@ public class TransactionIntegrationTest {
         System.out.println("[TEST RESULT] PASSED - Exactly 5 succeeded, 5 failed with insufficient funds. Final balance is ₹0.");
         System.out.println("=".repeat(80) + "\n");
     }
+
+    @Test
+    @DisplayName("Edge Case: Rejects debit when wallet has insufficient balance on single request.")
+    void testSingleDebitInsufficientFunds() {
+        UUID userId = UUID.randomUUID();
+        walletRepository.saveAndFlush(new Wallet(userId, new BigDecimal("50.00")));
+
+        TransactionRequest request = new TransactionRequest(
+                UUID.randomUUID(),
+                userId,
+                new BigDecimal("100.00"),
+                TransactionType.DEBIT
+        );
+
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                getEndpointUrl(),
+                new HttpEntity<>(request, createHeaders()),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        Wallet wallet = walletRepository.findById(userId).orElseThrow();
+        assertThat(wallet.getBalance().setScale(2, RoundingMode.HALF_UP))
+                .isEqualTo(new BigDecimal("50.00"));
+    }
+
+    @Test
+    @DisplayName("Edge Case: Rejects debit when wallet does not exist (returns 404 Not Found).")
+    void testWalletNotFound() {
+        UUID nonExistentUserId = UUID.randomUUID();
+
+        TransactionRequest request = new TransactionRequest(
+                UUID.randomUUID(),
+                nonExistentUserId,
+                new BigDecimal("50.00"),
+                TransactionType.DEBIT
+        );
+
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                getEndpointUrl(),
+                new HttpEntity<>(request, createHeaders()),
+                String.class
+        );
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
 }

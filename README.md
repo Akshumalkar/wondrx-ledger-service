@@ -114,20 +114,26 @@ The test suite requires **zero external configuration**.
 3. Right-click `TransactionIntegrationTest` -> Click **Run 'TransactionIntegrationTest'**.
 4. The test console clearly prints the **Intent** and **Result** for every scenario.
 
-### Option B: Via Command Line (Maven)
+### Option B: Via Command Line (Maven Wrapper included)
 ```bash
-mvn clean test
+# Linux / macOS
+./mvnw clean test
+
+# Windows (PowerShell / CMD)
+.\mvnw.cmd clean test
 ```
 
 ---
 
-## Required Test Cases Verified
+## Test Cases Verified
 
 | Test Case | Scenario Description | Status |
 | :--- | :--- | :---: |
 | **Happy Path Test** | *Processes a single valid debit transaction successfully.* | **PASSED** |
 | **Idempotency Test** | *Sends 3 identical transactionIDs simultaneously. Ensures the balance is only deducted once.* (1 succeeded with 200 OK, 2 rejected with 409 Conflict) | **PASSED** |
 | **Race Condition Test** | *Sends 10 concurrent debit requests of ₹100 for a wallet with a ₹500 balance. Ensures the final balance is exactly ₹0 and 5 requests fail with insufficient funds.* | **PASSED** |
+| **Edge Case: Insufficient Funds** | *Rejects single debit request when wallet balance is lower than transaction amount.* | **PASSED** |
+| **Edge Case: Wallet Not Found** | *Returns HTTP 404 when debiting against a non-existent wallet ID.* | **PASSED** |
 
 ---
 
